@@ -1,0 +1,399 @@
+name: Build APK
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create project files
+        run: |
+          mkdir -p app
+          cat > app/build.gradle <<'SATEOF'
+          plugins { id 'com.android.application'; id 'org.jetbrains.kotlin.android' }
+          android {
+              namespace 'com.satellite.app'
+              compileSdk 34
+              defaultConfig { applicationId "com.satellite.app"; minSdk 26; targetSdk 34; versionCode 1; versionName "1.0" }
+              buildTypes { release { minifyEnabled false } }
+              compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
+              kotlinOptions { jvmTarget = '17' }
+              packagingOptions { jniLibs { useLegacyPackaging = true } }
+          }
+          dependencies {
+              implementation 'com.squareup.okhttp3:okhttp:4.12.0'
+              implementation 'com.github.shiyinghan:UVCAndroid:1.0.+'   // مكتبة UVC (libuvc)
+          }
+          SATEOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'SATEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET"/>
+              <uses-permission android:name="android.permission.VIBRATE"/>
+              <uses-permission android:name="android.permission.CAMERA"/>
+              <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+              <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/>
+              <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28"/>
+              <uses-feature android:name="android.hardware.camera" android:required="false"/>
+              <uses-feature android:name="android.hardware.usb.host" android:required="false"/>
+              <application android:label="@string/app_name" android:icon="@mipmap/ic_launcher" android:roundIcon="@mipmap/ic_launcher"
+                  android:usesCleartextTraffic="true" android:supportsRtl="true" android:allowBackup="false"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true"
+                      android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize|screenLayout|uiMode"
+                      android:windowSoftInputMode="adjustResize" android:supportsPictureInPicture="true">
+                      <intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter>
+                  </activity>
+                  <activity android:name=".UvcActivity" android:exported="false" android:screenOrientation="landscape"
+                      android:configChanges="orientation|screenSize|keyboardHidden"
+                      android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen">
+                      <intent-filter><action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"/></intent-filter>
+                      <meta-data android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" android:resource="@xml/device_filter"/>
+                  </activity>
+              </application>
+          </manifest>
+          SATEOF
+          mkdir -p app/src/main/java/com/satellite/app
+          cat > app/src/main/java/com/satellite/app/MainActivity.kt <<'SATEOF'
+          package com.satellite.app
+
+          import android.Manifest
+          import android.annotation.SuppressLint
+          import android.app.Activity
+          import android.content.ContentValues
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Environment
+          import android.os.VibrationEffect
+          import android.os.Vibrator
+          import android.os.VibratorManager
+          import android.provider.MediaStore
+          import android.view.View
+          import android.view.ViewGroup
+          import android.view.WindowManager
+          import android.webkit.JavascriptInterface
+          import android.webkit.PermissionRequest
+          import android.webkit.WebChromeClient
+          import android.webkit.WebResourceRequest
+          import android.webkit.WebResourceResponse
+          import android.webkit.WebSettings
+          import android.webkit.WebView
+          import android.webkit.WebViewClient
+          import okhttp3.OkHttpClient
+          import okhttp3.Request
+          import org.json.JSONObject
+          import java.io.File
+
+          /** جسر صفحة ستالايت: ترويسات القناة الحالية + شاشة كارت الالتقاط + حفظ الملفات في التنزيلات */
+          class SatBridge(private val act: Activity? = null) {
+              @Volatile var referer = ""; @Volatile var origin = ""; @Volatile var ua = ""
+
+              @JavascriptInterface fun setHeaders(json: String) {
+                  try { val o = JSONObject(json); referer = o.optString("referer"); origin = o.optString("origin"); ua = o.optString("userAgent") }
+                  catch (_: Exception) { referer = ""; origin = ""; ua = "" }
+              }
+
+              @JavascriptInterface fun openUvc() {
+                  act?.runOnUiThread { act.startActivity(Intent(act, UvcActivity::class.java)) }
+              }
+
+              @JavascriptInterface fun saveText(name: String, mime: String, text: String): Boolean {
+                  val a = act ?: return false
+                  return try {
+                      val safe = name.replace(Regex("[^A-Za-z0-9._-]"), "_")
+                      if (Build.VERSION.SDK_INT >= 29) {
+                          val v = ContentValues().apply {
+                              put(MediaStore.Downloads.DISPLAY_NAME, safe)
+                              put(MediaStore.Downloads.MIME_TYPE, mime)
+                              put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+                          }
+                          val uri = a.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v) ?: return false
+                          a.contentResolver.openOutputStream(uri)?.use { it.write(text.toByteArray(Charsets.UTF_8)) } ?: return false
+                      } else {
+                          val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                          dir.mkdirs(); File(dir, safe).writeText(text, Charsets.UTF_8)
+                      }
+                      true
+                  } catch (_: Exception) { false }
+              }
+          }
+
+          /** اهتزاز أصلي (نفس جسر برنامج المحاسبة) */
+          class AccNative(private val ctx: Context) {
+              private val vib: Vibrator by lazy {
+                  if (Build.VERSION.SDK_INT >= 31) (ctx.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator
+                  else @Suppress("DEPRECATION") ctx.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+              }
+              @JavascriptInterface fun vibrate(ms: Int) {
+                  val d = ms.coerceIn(1, 3000).toLong()
+                  if (Build.VERSION.SDK_INT >= 26) vib.vibrate(VibrationEffect.createOneShot(d, VibrationEffect.DEFAULT_AMPLITUDE))
+                  else @Suppress("DEPRECATION") vib.vibrate(d)
+              }
+          }
+
+          class MainActivity : Activity() {
+              private lateinit var web: WebView
+              private lateinit var root: ViewGroup
+              private val bridge = SatBridge(this)
+              private var customView: View? = null
+              private var customCb: WebChromeClient.CustomViewCallback? = null
+              private val http = OkHttpClient.Builder().followRedirects(true).followSslRedirects(true).build()
+              private val mediaRe = Regex("""\.(m3u8|ts|m4s|mp4|aac|mpd|m4a)(\?|$)""", RegexOption.IGNORE_CASE)
+
+              @SuppressLint("SetJavaScriptEnabled")
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                  // أذونات الكاميرا والمايك على مستوى النظام (مطلوبة لكارت الالتقاط)
+                  if (Build.VERSION.SDK_INT >= 23) {
+                      val need = arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)
+                          .filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+                      if (need.isNotEmpty()) requestPermissions(need.toTypedArray(), 7)
+                  }
+                  web = WebView(this)
+                  root = android.widget.FrameLayout(this).also { it.addView(web, ViewGroup.LayoutParams(-1, -1)) }
+                  setContentView(root)
+
+                  web.settings.apply {
+                      javaScriptEnabled = true; domStorageEnabled = true
+                      mediaPlaybackRequiresUserGesture = false
+                      allowFileAccess = true; allowFileAccessFromFileURLs = true; allowUniversalAccessFromFileURLs = true
+                      mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                  }
+                  web.addJavascriptInterface(bridge, "SatBridge")
+                  web.addJavascriptInterface(AccNative(this), "AccNative")
+
+                  web.webChromeClient = object : WebChromeClient() {
+                      override fun onPermissionRequest(r: PermissionRequest) { runOnUiThread { r.grant(r.resources) } }
+                      override fun onShowCustomView(v: View, cb: CustomViewCallback) {
+                          if (customView != null) { cb.onCustomViewHidden(); return }
+                          customView = v; customCb = cb
+                          root.addView(v, ViewGroup.LayoutParams(-1, -1)); web.visibility = View.GONE
+                          window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_FULLSCREEN or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                      }
+                      override fun onHideCustomView() {
+                          customView?.let { root.removeView(it) }; customView = null
+                          web.visibility = View.VISIBLE; customCb?.onCustomViewHidden(); customCb = null
+                          window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_VISIBLE
+                      }
+                  }
+
+                  web.webViewClient = object : WebViewClient() {
+                      override fun shouldInterceptRequest(view: WebView, req: WebResourceRequest): WebResourceResponse? {
+                          val url = req.url.toString()
+                          if (req.method != "GET" || !url.startsWith("http") || !mediaRe.containsMatchIn(url)) return null
+                          if (bridge.referer.isEmpty() && bridge.origin.isEmpty() && bridge.ua.isEmpty()) return null
+                          val rb = Request.Builder().url(url)
+                          req.requestHeaders.forEach { (k, v) -> rb.header(k, v) }          // يشمل Range
+                          if (bridge.ua.isNotEmpty()) rb.header("User-Agent", bridge.ua)
+                          if (bridge.referer.isNotEmpty()) rb.header("Referer", bridge.referer)
+                          if (bridge.origin.isNotEmpty()) rb.header("Origin", bridge.origin)
+                          return try {
+                              val r = http.newCall(rb.build()).execute()
+                              val type = r.header("Content-Type")?.substringBefore(";") ?: "application/octet-stream"
+                              val h = mutableMapOf("Access-Control-Allow-Origin" to "*")      // يحل CORS
+                              r.headers.names().forEach { n -> if (!n.equals("content-encoding", true)) h[n] = r.header(n)!! }
+                              WebResourceResponse(type, r.header("Content-Encoding"), r.code, r.message.ifEmpty { "OK" }, h, r.body?.byteStream())
+                          } catch (e: Exception) { null }
+                      }
+                  }
+                  web.loadUrl("file:///android_asset/index.html")
+              }
+
+              override fun onBackPressed() {
+                  when {
+                      customView != null -> web.webChromeClient?.onHideCustomView()
+                      else -> web.evaluateJavascript("(function(){try{return window.__satBack?window.__satBack():false}catch(e){return false}})()") { r ->
+                          if (r != "true") { if (web.canGoBack()) web.goBack() else finish() }
+                      }
+                  }
+              }
+          }
+          SATEOF
+          mkdir -p app/src/main/java/com/satellite/app
+          cat > app/src/main/java/com/satellite/app/UvcActivity.kt <<'SATEOF'
+          package com.satellite.app
+
+          import android.app.Activity
+          import android.graphics.Color
+          import android.hardware.usb.UsbDevice
+          import android.media.*
+          import android.os.Build
+          import android.os.Bundle
+          import android.view.Gravity
+          import android.view.Surface
+          import android.view.SurfaceHolder
+          import android.view.SurfaceView
+          import android.view.View
+          import android.view.WindowManager
+          import android.widget.FrameLayout
+          import android.widget.TextView
+          import com.herohan.uvcapp.CameraHelper
+          import com.herohan.uvcapp.ICameraHelper
+
+          /** شاشة أصلية لعرض كارت التقاط UVC عبر OTG، مع نقل صوت الكارت (USB Audio) إن وُجد. */
+          class UvcActivity : Activity() {
+              private var helper: ICameraHelper? = null
+              private var surface: Surface? = null
+              private var opened = false
+              private lateinit var status: TextView
+              private var audioThread: Thread? = null
+              @Volatile private var audioRun = false
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                  val root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+                  val sv = SurfaceView(this)
+                  root.addView(sv, FrameLayout.LayoutParams(-1, -1, Gravity.CENTER))
+                  status = TextView(this).apply {
+                      text = "وصّل كارت الالتقاط عبر OTG…"; setTextColor(Color.WHITE); textSize = 15f; setBackgroundColor(0x99000000.toInt())
+                      setPadding(24, 14, 24, 14)
+                  }
+                  root.addView(status, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.CENTER_HORIZONTAL).apply { topMargin = 24 })
+                  val close = TextView(this).apply {
+                      text = "إغلاق"; setTextColor(Color.WHITE); textSize = 15f; setBackgroundColor(0xCC0F172A.toInt()); setPadding(36, 18, 36, 18)
+                      setOnClickListener { finish() }
+                  }
+                  root.addView(close, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.END).apply { setMargins(24, 24, 24, 24) })
+                  setContentView(root)
+                  window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_FULLSCREEN or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+
+                  sv.holder.addCallback(object : SurfaceHolder.Callback {
+                      override fun surfaceCreated(h: SurfaceHolder) { surface = h.surface; if (opened) helper?.addSurface(h.surface, false) }
+                      override fun surfaceChanged(h: SurfaceHolder, f: Int, w: Int, hh: Int) {}
+                      override fun surfaceDestroyed(h: SurfaceHolder) { surface?.let { try { helper?.removeSurface(it) } catch (_: Exception) {} }; surface = null }
+                  })
+                  initCamera()
+              }
+
+              private fun initCamera() {
+                  try {
+                      helper = CameraHelper().also { hp ->
+                          hp.setStateCallback(object : ICameraHelper.StateCallback {
+                              override fun onAttach(device: UsbDevice) { hp.selectDevice(device) }
+                              override fun onDeviceOpen(device: UsbDevice, isFirstOpen: Boolean) { hp.openCamera() }
+                              override fun onCameraOpen(device: UsbDevice) {
+                                  hp.startPreview(); opened = true
+                                  surface?.let { hp.addSurface(it, false) }
+                                  runOnUiThread { status.text = "يعمل: " + (device.productName ?: "كارت التقاط"); status.postDelayed({ status.visibility = View.GONE }, 2500) }
+                                  startAudio()
+                              }
+                              override fun onCameraClose(device: UsbDevice) { opened = false; stopAudio(); surface?.let { try { hp.removeSurface(it) } catch (_: Exception) {} } }
+                              override fun onDeviceClose(device: UsbDevice) {}
+                              override fun onDetach(device: UsbDevice) { runOnUiThread { status.visibility = View.VISIBLE; status.text = "تم فصل الكارت" } }
+                              override fun onCancel(device: UsbDevice) { runOnUiThread { status.visibility = View.VISIBLE; status.text = "تم رفض إذن USB" } }
+                          })
+                          // إن كان الكارت موصولًا مسبقًا
+                          try { hp.deviceList?.firstOrNull()?.let { hp.selectDevice(it) } } catch (_: Exception) {}
+                      }
+                  } catch (e: Throwable) { status.text = "تعذر تشغيل مكتبة UVC: " + e.message }
+              }
+
+              /** نقل الصوت من مدخل USB إلى مخرج الهاتف (إن كان الكارت يوفر صوتًا) */
+              private fun startAudio() {
+                  if (audioRun || Build.VERSION.SDK_INT < 23) return
+                  val am = getSystemService(AUDIO_SERVICE) as AudioManager
+                  val usbIn = am.getDevices(AudioManager.GET_DEVICES_INPUTS).firstOrNull {
+                      it.type == AudioDeviceInfo.TYPE_USB_DEVICE || it.type == AudioDeviceInfo.TYPE_USB_HEADSET
+                  } ?: return                                    // لا يوجد صوت USB: لا نشغّل مايك الهاتف لتفادي الصدى
+                  val rate = 48000; val ch = AudioFormat.CHANNEL_IN_STEREO
+                  val min = AudioRecord.getMinBufferSize(rate, ch, AudioFormat.ENCODING_PCM_16BIT)
+                  if (min <= 0) return
+                  try {
+                      val rec = AudioRecord(MediaRecorder.AudioSource.MIC, rate, ch, AudioFormat.ENCODING_PCM_16BIT, min * 2)
+                      rec.preferredDevice = usbIn
+                      val trk = AudioTrack.Builder()
+                          .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_MOVIE).build())
+                          .setAudioFormat(AudioFormat.Builder().setSampleRate(rate).setEncoding(AudioFormat.ENCODING_PCM_16BIT).setChannelMask(AudioFormat.CHANNEL_OUT_STEREO).build())
+                          .setBufferSizeInBytes(min * 2).setTransferMode(AudioTrack.MODE_STREAM).build()
+                      audioRun = true
+                      audioThread = Thread {
+                          val buf = ByteArray(min)
+                          try { rec.startRecording(); trk.play()
+                              while (audioRun) { val n = rec.read(buf, 0, buf.size); if (n > 0) trk.write(buf, 0, n) }
+                          } catch (_: Exception) {} finally {
+                              try { rec.stop() } catch (_: Exception) {}; rec.release(); try { trk.stop() } catch (_: Exception) {}; trk.release()
+                          }
+                      }.also { it.start() }
+                  } catch (_: Exception) { audioRun = false }
+              }
+              private fun stopAudio() { audioRun = false }
+
+              override fun onDestroy() { stopAudio(); try { helper?.release() } catch (_: Exception) {}; helper = null; super.onDestroy() }
+          }
+          SATEOF
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/ic_launcher_foreground.xml <<'SATEOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+              <path android:strokeColor="#2DD4BF" android:strokeWidth="6" android:strokeLineCap="round" android:fillColor="#00000000" android:pathData="M34,50 A26,26 0 0 0 58,76"/>
+              <path android:strokeColor="#2DD4BF" android:strokeWidth="6" android:strokeLineCap="round" android:fillColor="#00000000" android:pathData="M42,42 A34,34 0 0 0 66,66"/>
+              <path android:strokeColor="#A78BFA" android:strokeWidth="6" android:strokeLineCap="round" android:fillColor="#00000000" android:pathData="M60,34 L74,48 M52,56 L68,40"/>
+              <path android:fillColor="#FFFFFF" android:pathData="M72,28 m-4,0 a4,4 0 1,0 8,0 a4,4 0 1,0 -8,0"/>
+          </vector>
+          SATEOF
+          mkdir -p app/src/main/res/mipmap-anydpi-v26
+          cat > app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml <<'SATEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/ic_bg"/>
+              <foreground android:drawable="@drawable/ic_launcher_foreground"/>
+          </adaptive-icon>
+          SATEOF
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/colors.xml <<'SATEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="ic_bg">#0B1220</color>
+          </resources>
+          SATEOF
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'SATEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">ستالايت</string>
+          </resources>
+          SATEOF
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/device_filter.xml <<'SATEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <usb-device class="239" subclass="2" protocol="1"/>
+              <usb-device class="14"/>
+              <usb-device class="255"/>
+          </resources>
+          SATEOF
+          cat > build.gradle <<'SATEOF'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+              id 'org.jetbrains.kotlin.android' version '1.9.24' apply false
+          }
+          SATEOF
+          cat > gradle.properties <<'SATEOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          SATEOF
+          cat > settings.gradle <<'SATEOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral(); maven { url 'https://jitpack.io' } } }
+          rootProject.name = "Satellite"
+          include ':app'
+          SATEOF
+          mkdir -p app/src/main/assets
+          cp index.html app/src/main/assets/index.html
+          find . -path ./.git -prune -o -type f -print
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - run: gradle assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: satellite-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
